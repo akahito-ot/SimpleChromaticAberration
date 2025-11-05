@@ -4,7 +4,7 @@ A lightweight **chromatic aberration** effect for **DaVinci Resolve / Fusion**, 
 
 ---
 
-## ✨ Features
+## Features
 - GPU-accelerated DCTL processing  
 - Pixel-based **Spread** and optional **Blur**  
 - **Border-aware sampling** (Clamp / Wrap / Mirror / Black)  
@@ -15,7 +15,7 @@ A lightweight **chromatic aberration** effect for **DaVinci Resolve / Fusion**, 
 
 ---
 
-## 🧠 Description
+## Description
 
 This effect simulates chromatic aberration by shifting RGB channels separately in space.  
 Unlike purely optical simulation, this version emphasizes **artistic control and speed**.  
@@ -23,7 +23,7 @@ Ideal for compositing, stylization, or adding subtle fringing.
 
 ---
 
-## 📦 Installation
+## Installation
 
 1. Place `SimpleChromaticAberration.fuse` into your **Fusion Modules / Fuses** folder:
 
@@ -38,7 +38,7 @@ Ideal for compositing, stylization, or adding subtle fringing.
 
 ---
 
-## ⚙️ Parameters
+## Parameters
 
 | Parameter | Description |
 |------------|-------------|
@@ -54,7 +54,7 @@ Ideal for compositing, stylization, or adding subtle fringing.
 
 ---
 
-## 🧑‍💻 Author
+## Author
 **akahito_ot**  
 [itch.io](https://akahito-ot.itch.io) / [GitHub](https://github.com/akahito-ot)
 
