@@ -2,6 +2,8 @@
 
 A lightweight **chromatic aberration** effect for **DaVinci Resolve / Fusion**, implemented in `.fuse` format with a DCTL kernel.
 
+![git-1](https://github.com/user-attachments/assets/5b10115b-84a1-4684-9361-6f4bcd0b52c5)
+
 ---
 
 ## Features
