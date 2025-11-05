@@ -1,4 +1,4 @@
-# Simple Chromatic Aberration (GPU)
+# Simple Chromatic Aberration
 
 A lightweight **chromatic aberration** effect for **DaVinci Resolve / Fusion**, implemented in `.fuse` format with a DCTL kernel.
 
