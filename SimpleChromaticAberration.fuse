@@ -1,0 +1,501 @@
+--[[ 
+SimpleChromaticAberration.fuse
+Author: akahito_ot
+License: MIT
+Version: 1.0
+Description:
+    A lightweight GPU-accelerated chromatic aberration effect for DaVinci Resolve / Fusion.
+    Features:
+      - Pixel-based Spread & optional Blur
+      - Border-aware sampling (Clamp / Wrap / Mirror / Black)
+      - Preserve Alpha option
+      - Adjustable anchor, rotation, and scale
+      - Fast DCTL kernel
+]]
+
+
+FuRegisterClass("SimpleChromaticAberration", CT_Tool, {
+    REGS_Category = "AK_Tools",
+    REGS_OpIconString = "CA",
+    REGS_OpDescription = "Chromatic Aberration - GPU Accelerated with Spread & Blur",
+    REG_NoMotionBlurCtrls = true,
+})
+
+-- Parameter structure definition
+CAParams = [[
+    int width;
+    int height;
+    int channels;
+    float position;
+    float rotation;
+    float scale;
+    float anchorX;
+    float anchorY;
+    float spread;
+    int spreadSamples;
+    float blur;
+    int blurQuality;
+    int edgeMode;
+    float preserveAlpha;
+    float mix;
+]]
+
+-- DCTL Kernel Source
+CAKernelSource = [[
+__DEVICE__ float2 applyEdgeMode(float2 uv, int edgeMode) {
+    if (edgeMode == 0) {
+        // Clamp: clamp coordinates to [0, 1]
+        uv.x = _clampf(uv.x, 0.0f, 1.0f);
+        uv.y = _clampf(uv.y, 0.0f, 1.0f);
+    } else if (edgeMode == 1) {
+        // Wrap: tile/repeat the image
+        uv.x = uv.x - _floor(uv.x);
+        uv.y = uv.y - _floor(uv.y);
+    } else if (edgeMode == 2) {
+        // Mirror: repeat with reflection
+        uv.x = _fmod(_fabs(uv.x), 2.0f);
+        if (uv.x > 1.0f) uv.x = 2.0f - uv.x;
+        
+        uv.y = _fmod(_fabs(uv.y), 2.0f);
+        if (uv.y > 1.0f) uv.y = 2.0f - uv.y;
+    }
+    return uv;
+}
+
+__DEVICE__ float4 texSampleWithBorder(
+    __TEXTURE2D__ src, float2 uv, int edgeMode, float4 borderColor) {
+    if (edgeMode == 3) {
+        // Border: return border color (black) for out-of-bounds coordinates
+        if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f)
+            return borderColor;
+    }
+    uv = applyEdgeMode(uv, edgeMode);
+    return _tex2DVec4(src, uv.x, uv.y);
+}
+
+__DEVICE__ float4 applyBoxBlur(
+    __TEXTURE2D__ src,
+    float2 centerUV,
+    float blurRadius,
+    float invWidth,
+    float invHeight,
+    int blurQuality,
+    int edgeMode)
+{
+    float4 blurAccum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    int blurSamples = 0;
+    
+    // Determine blur kernel radius based on quality setting
+    int radius = 2; // Fast (5x5 = 25 samples)
+    if (blurQuality == 1) {
+        radius = 3; // Medium (7x7 = 49 samples)
+    } else if (blurQuality == 2) {
+        radius = 5; // High (11x11 = 121 samples)
+    } else if (blurQuality == 3) {
+        radius = 7; // Ultra (15x15 = 225 samples)
+    }
+    
+    // Variable box blur based on quality
+    for (int by = -radius; by <= radius; by++) {
+        for (int bx = -radius; bx <= radius; bx++) {
+            // Calculate pixel offset scaled by blur value
+            float offsetX = (float)bx * blurRadius * invWidth;
+            float offsetY = (float)by * blurRadius * invHeight;
+            
+            float2 blurUV = make_float2(centerUV.x + offsetX, centerUV.y + offsetY);
+            
+            blurAccum += texSampleWithBorder(src, blurUV, edgeMode, make_float4(0.0f, 0.0f, 0.0f, 0.0f));
+            blurSamples++;
+        }
+    }
+    
+    return blurAccum / (float)blurSamples;
+}
+
+__KERNEL__ void ChromaticAberrationKernel(
+    __CONSTANTREF__ CAParams *params,
+    __TEXTURE2D__ src,
+    __TEXTURE2D_WRITE__ dst)
+{
+    DEFINE_KERNEL_ITERATORS_XY(x, y);
+    
+    if (x >= params->width || y >= params->height)
+        return;
+    
+    // Normalize coordinates to [0, 1]
+    float2 uv = make_float2((float)x / (float)params->width, 
+                            (float)y / (float)params->height);
+    
+    // Center coordinates (anchor point)
+    float2 center = make_float2(params->anchorX / 100.0f, params->anchorY / 100.0f);
+    float2 coord = uv - center;
+    
+    // Calculate offset based on position and rotation
+    float rad = params->rotation * 3.14159265359f / 180.0f;
+    float offsetDist = params->position * 0.01f;
+
+    float2 offset = make_float2(
+        offsetDist * _cosf(rad),
+        offsetDist * _sinf(rad)
+    );
+
+    // Pre-calculate inverse dimensions for pixel-to-UV conversion
+    float invWidth = 1.0f / (float)params->width;
+    float invHeight = 1.0f / (float)params->height;
+
+    // Apply scaling from center for each channel (inverted scale)
+    float scale1 = params->scale;
+    float scale2 = 2.0f - params->scale;
+
+    float2 scaledCoord1 = coord * scale1;
+    float2 scaledCoord2 = coord * scale2;
+
+    // Pre-calculate constants for spread sampling
+    float4 blackColor = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float angleStep = 2.0f * 3.14159265359f / (float)params->spreadSamples;
+    
+    // Sample original pixel
+    float4 original = _tex2DVec4(src, uv.x, uv.y);
+    
+    // Initialize result with original
+    float4 result = original;
+    
+    // Spread sampling for chromatic aberration
+    if (params->spread > 0.01f) {
+        float4 accumR = blackColor;
+        float4 accumG = blackColor;
+        float4 accumB = blackColor;
+        float totalWeight = 0.0f;
+        
+        // Spread in pixel units
+        float spreadPx = params->spread;
+        int samples = params->spreadSamples;
+        
+        for (int i = 0; i < samples; i++) {
+            float angle = (float)i * angleStep;
+            // Convert pixel spread to UV offset
+            float2 spreadOffset = make_float2(
+                _cosf(angle) * spreadPx * invWidth,
+                _sinf(angle) * spreadPx * invHeight
+            );
+            
+            // Calculate sampling coordinates for each channel with spread
+            float2 uv1 = (scaledCoord1 + offset + spreadOffset) + center;
+            float2 uv2 = (scaledCoord2 - offset + spreadOffset) + center;
+            
+            // Sample pixels
+            float4 sample1, sample2;
+                
+            // Apply blur if enabled
+            if (params->blur > 0.01f) {
+                sample1 = applyBoxBlur(src, uv1, params->blur, invWidth, invHeight, params->blurQuality, params->edgeMode);
+                sample2 = applyBoxBlur(src, uv2, params->blur, invWidth, invHeight, params->blurQuality, params->edgeMode);
+            } else {
+                // No blur - sharp sampling
+                sample1 = texSampleWithBorder(src, uv1, params->edgeMode, blackColor);
+                sample2 = texSampleWithBorder(src, uv2, params->edgeMode, blackColor);
+            }
+            
+            float weight = 1.0f;
+            
+            // Accumulate samples for each channel based on selection
+            if (params->channels == 0) {
+                // Red & Blue
+                accumR += sample1 * weight;
+                accumG += original * weight;  // Keep original green
+                accumB += sample2 * weight;
+            } else if (params->channels == 1) {
+                // Red & Green
+                accumR += sample1 * weight;
+                accumG += sample2 * weight;
+                accumB += original * weight;  // Keep original blue
+            } else if (params->channels == 2) {
+                // Green & Blue
+                accumR += original * weight;  // Keep original red
+                accumG += sample1 * weight;
+                accumB += sample2 * weight;
+            }
+            
+            totalWeight += weight;
+        }
+        
+        // Normalize accumulated samples
+        if (totalWeight > 0.0f) {
+            result.x = accumR.x / totalWeight;
+            result.y = accumG.y / totalWeight;
+            result.z = accumB.z / totalWeight;
+            result.w = original.w;
+        }
+    } else {
+        // No spread mode (simple offset)
+        float2 uv1 = (scaledCoord1 + offset) + center;
+        float2 uv2 = (scaledCoord2 - offset) + center;
+        
+        // Sample pixels with optional box blur for moved channels
+        float4 shifted1, shifted2;
+        
+        if (params->blur > 0.01f) {
+            shifted1 = applyBoxBlur(src, uv1, params->blur, invWidth, invHeight, params->blurQuality, params->edgeMode);
+            shifted2 = applyBoxBlur(src, uv2, params->blur, invWidth, invHeight, params->blurQuality, params->edgeMode);
+        } else {
+            // No blur - sharp sampling
+            shifted1 = texSampleWithBorder(src, uv1, params->edgeMode, blackColor);
+            shifted2 = texSampleWithBorder(src, uv2, params->edgeMode, blackColor);
+        }
+        
+        // Apply channel shift based on selection
+        if (params->channels == 0) {
+            // Red & Blue
+            result.x = shifted1.x;
+            result.z = shifted2.z;
+        } else if (params->channels == 1) {
+            // Red & Green
+            result.x = shifted1.x;
+            result.y = shifted2.y;
+        } else if (params->channels == 2) {
+            // Green & Blue
+            result.y = shifted1.y;
+            result.z = shifted2.z;
+        }
+    }
+    
+    // Preserve original alpha if enabled
+    if (params->preserveAlpha > 0.5f) {
+        result.w = original.w;
+    }
+    
+    // Mix with original image
+    if (params->mix > 0.0f) {
+        result.x = _mix(result.x, original.x, params->mix);
+        result.y = _mix(result.y, original.y, params->mix);
+        result.z = _mix(result.z, original.z, params->mix);
+    }
+    
+    _tex2DVec4Write(dst, x, y, result);
+}
+]]
+
+function Create()
+    -- Input
+    InImage = self:AddInput("Input", "Input", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+    
+    -- Channel Selection
+    InChannels = self:AddInput("Channels", "Channels", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0.0,
+        {CCS_AddString = "Red & Blue"},
+        {CCS_AddString = "Red & Green"},
+        {CCS_AddString = "Green & Blue"},
+    })
+    
+    -- Transform Section
+    self:BeginControlNest("Transform", "Transform", true, {})
+    
+    InPosition = self:AddInput("Position", "Position", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinScale = -100.0,
+        INP_MaxScale = 100.0,
+        INP_MinAllowed = -1000.0,
+        INP_MaxAllowed = 1000.0,
+    })
+    
+    InRotation = self:AddInput("Rotation", "Rotation", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ScrewControl",
+        INP_Default = 0.0,
+        INP_MinScale = -180.0,
+        INP_MaxScale = 180.0,
+    })
+    
+    InScale = self:AddInput("Scale", "Scale", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 100.0,
+        INP_MinScale = 50.0,
+        INP_MaxScale = 150.0,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 500.0,
+    })
+
+    InAnchorX = self:AddInput("Anchor X", "AnchorX", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 50.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 100.0,
+    })
+
+    InAnchorY = self:AddInput("Anchor Y", "AnchorY", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 50.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 100.0,
+    })
+    
+    self:EndControlNest()
+    
+    -- Style Section
+    self:BeginControlNest("Style", "Style", true, {})
+
+    -- Spread (in pixels)
+    InSpread = self:AddInput("Spread", "Spread", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 10.0,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 100.0,
+    })
+    
+    -- Spread Samples
+    InSpreadSamples = self:AddInput("Spread Samples", "SpreadSamples", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 5.0,
+        INP_MinScale = 2.0,
+        INP_MaxScale = 10.0,
+        INP_MinAllowed = 2.0,
+        INP_MaxAllowed = 20.0,
+        INP_Integer = true,
+    })
+    
+    -- Blur (in pixels, for moved channels only)
+    InBlur = self:AddInput("Blur", "Blur", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 5.0,
+        INP_MinAllowed = 0.0,
+        INP_MaxAllowed = 20.0,
+    })
+
+    -- Blur Quality
+    InBlurQuality = self:AddInput("Blur Quality", "BlurQuality", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 1.0,
+        {CCS_AddString = "Fast (5x5)"},
+        {CCS_AddString = "Medium (7x7)"},
+        {CCS_AddString = "High (11x11)"},
+        {CCS_AddString = "Ultra (15x15)"},
+    })
+
+    self:EndControlNest()
+
+    -- Compositing Section
+    self:BeginControlNest("Compositing", "Compositing", true, {})
+    
+    InEdgeMode = self:AddInput("Edge Mode", "EdgeMode", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "ComboControl",
+        INP_Default = 0.0,
+        {CCS_AddString = "Clamp"},
+        {CCS_AddString = "Wrap"},
+        {CCS_AddString = "Mirror"},
+        {CCS_AddString = "Border (Black)"},
+    })
+    
+    InPreserveAlpha = self:AddInput("Preserve Original Alpha", "PreserveAlpha", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "CheckboxControl",
+        INP_Default = 1.0,
+        INP_Integer = true,
+    })
+    
+    InMixWithOriginal = self:AddInput("Mix With Original", "MixWithOriginal", {
+        LINKID_DataType = "Number",
+        INPID_InputControl = "SliderControl",
+        INP_Default = 0.0,
+        INP_MinScale = 0.0,
+        INP_MaxScale = 100.0,
+        IC_DisplayedPrecision = 2,
+    })
+    
+    self:EndControlNest()
+    
+    -- Output
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image",
+        LINK_Main = 1,
+    })
+end
+
+function Process(req)
+    local img = InImage:GetValue(req)
+    
+    if not img then
+        return
+    end
+    
+    local channels = InChannels:GetValue(req).Value
+    local position = InPosition:GetValue(req).Value
+    local rotation = InRotation:GetValue(req).Value
+    local scale = InScale:GetValue(req).Value / 100.0
+    local anchorX = InAnchorX:GetValue(req).Value
+    local anchorY = InAnchorY:GetValue(req).Value
+    local spread = InSpread:GetValue(req).Value
+    local spreadSamples = InSpreadSamples:GetValue(req).Value
+    local blur = InBlur:GetValue(req).Value
+    local blurQuality = InBlurQuality:GetValue(req).Value
+    local edgeMode = InEdgeMode:GetValue(req).Value
+    local preserveAlpha = InPreserveAlpha:GetValue(req).Value
+    local mix = InMixWithOriginal:GetValue(req).Value / 100.0
+    
+    -- Create output image
+    local out = Image({IMG_Like = img, IMG_DeferAlloc = false})
+    
+    -- Create DCTL compute node
+    local node = DVIPComputeNode(req, "ChromaticAberrationKernel", CAKernelSource, 
+                                 "CAParams", CAParams)
+    
+    if not node then
+        print("Failed to create DCTL compute node")
+        OutImage:Set(req, img)
+        return
+    end
+    
+    -- Setup kernel parameters
+    local params = node:GetParamBlock(CAParams)
+    params.width = img.Width
+    params.height = img.Height
+    params.channels = channels
+    params.position = position
+    params.rotation = rotation
+    params.scale = scale
+    params.anchorX = anchorX
+    params.anchorY = anchorY
+    params.spread = spread
+    params.spreadSamples = spreadSamples
+    params.blur = blur
+    params.blurQuality = blurQuality
+    params.edgeMode = edgeMode
+    params.preserveAlpha = preserveAlpha
+    params.mix = mix
+    
+    node:SetParamBlock(params)
+    node:AddSampler("RowSampler", TEX_FILTER_MODE_LINEAR, 
+                TEX_ADDRESS_MODE_CLAMP, TEX_NORMALIZED_COORDS_TRUE)
+    
+    -- Add input and output
+    node:AddInput("src", img)
+    node:AddOutput("dst", out)
+    
+    -- Run the kernel
+    local success = node:RunSession(req)
+    
+    if success then
+        OutImage:Set(req, out)
+    else
+        print("DCTL kernel execution failed")
+        OutImage:Set(req, img)
+    end
+end
